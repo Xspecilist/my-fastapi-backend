@@ -1,0 +1,209 @@
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+import asyncio
+import trafilatura
+from transformers import pipeline
+from fastapi.responses import StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+import re
+
+# ---- Config ----
+BRAVE_SEARCH_API_URL = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_SUBSCRIPTION_TOKEN = "BSAYcmGcjd6eznA7um8osQlNpvCfD51"  # <-- put your real key here
+
+# Load summarizer globally (DistilBART)
+summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+
+app = FastAPI()
+
+# CORS for your React app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Country normalization (common aliases)
+COUNTRY_ALIASES = {
+    "UK": "GB",
+    "UAE": "AE",
+    "KOREA": "KR",
+    "SOUTH KOREA": "KR",
+    "NORTH KOREA": "KP",
+}
+
+def normalize_country(code: str) -> str:
+    if not code:
+        return "US"
+    c = code.strip().upper()
+    c = COUNTRY_ALIASES.get(c, c)
+    # Expect exactly 2 letters; fall back to US if invalid
+    if not re.fullmatch(r"[A-Z]{2}", c):
+        return "US"
+    return c
+
+async def fetch_readable_content(client: httpx.AsyncClient, url: str):
+    try:
+        resp = await client.get(url, timeout=10)
+        if resp.status_code == 200:
+            downloaded = resp.text
+            extracted = trafilatura.extract(downloaded)
+            # metadata access can fail silently; guard carefully
+            title = None
+            try:
+                md = trafilatura.metadata.extract_metadata(downloaded)
+                title = md.title if md and getattr(md, "title", None) else None
+            except Exception:
+                title = None
+
+            snippet = None
+            summary = None
+            if extracted:
+                snippet = extracted[:1000]
+                last_space = snippet.rfind(" ")
+                if last_space > 0:
+                    snippet = snippet[:last_space]
+
+                try:
+                    out = summarizer(snippet, max_length=120, min_length=30, do_sample=False)
+                    summary = out[0]["summary_text"]
+                except Exception as e:
+                    summary = "Summarization failed: " + str(e)
+
+            return {
+                "url": url,
+                "title": title,
+                "content": (snippet + "...") if snippet else None,
+                "summary": summary,
+            }
+        else:
+            return {"url": url, "title": None, "content": None, "summary": None}
+    except Exception:
+        return {"url": url, "title": None, "content": None, "summary": None}
+
+def brave_headers():
+    return {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        # Use Brave's documented casing; headers are case-insensitive but this avoids issues.
+        "X-Subscription-Token": BRAVE_SUBSCRIPTION_TOKEN,
+    }
+
+# ---------------- PDF endpoint ----------------
+@app.get("/generate_pdf")
+async def generate_pdf(
+    query: str = Query(..., min_length=1),
+    country: str = Query("US", description="ISO 3166-1 alpha-2 (e.g., US, IN, GB)"),
+    ui_lang: str = Query("en-US", description="BCP-47 tag (e.g., en, hi, en-GB, en-IN)"),
+):
+    country = normalize_country(country)
+
+    params = {
+        "q": query,
+        "country": country,
+        "ui_lang": ui_lang,
+        "count": 7,  # fetch a few
+    }
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(BRAVE_SEARCH_API_URL, headers=brave_headers(), params=params)
+        if r.status_code != 200:
+            # surface Brave error message so you can see what's wrong
+            detail = f"Brave API error {r.status_code}: {r.text}"
+            raise HTTPException(status_code=502, detail=detail)
+
+        data = r.json()
+        results = data.get("web", {}).get("results", [])
+        top_urls = [item.get("url") for item in results[:7] if item.get("url")]
+
+        readable_contents = await asyncio.gather(
+            *(fetch_readable_content(client, url) for url in top_urls)
+        )
+
+    # Generate PDF in memory
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    pdf.setTitle(f"Search Results for '{query}'")
+
+    y = height - 50
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(50, y, f"Search Results for: {query} ({country}, {ui_lang})")
+    y -= 30
+
+    pdf.setFont("Helvetica", 12)
+    for idx, item in enumerate(readable_contents, start=1):
+        if y < 120:
+            pdf.showPage()
+            y = height - 50
+            pdf.setFont("Helvetica", 12)
+
+        pdf.setFont("Helvetica-Bold", 12)
+        pdf.drawString(50, y, f"{idx}. {item.get('title') or 'No Title'}")
+        y -= 18
+
+        pdf.setFont("Helvetica-Oblique", 10)
+        pdf.drawString(60, y, item.get("url") or "")
+        y -= 14
+
+        pdf.setFont("Helvetica", 11)
+        summary = item.get("summary") or ""
+        for line in summary.split("\n"):
+            if y < 80:
+                pdf.showPage()
+                y = height - 50
+                pdf.setFont("Helvetica", 11)
+            pdf.drawString(60, y, line)
+            y -= 14
+        y -= 8
+
+    pdf.save()
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=search_results_{query}.pdf"},
+    )
+
+# ---------------- JSON endpoint ----------------
+@app.get("/search")
+async def brave_search(
+    query: str = Query(..., min_length=1),
+    country: str = Query("US", description="ISO 3166-1 alpha-2 (e.g., US, IN, GB)"),
+    ui_lang: str = Query("en", description="BCP-47 tag (e.g., en, hi, en-GB, en-IN)"),
+):
+    country = normalize_country(country)
+
+    params = {
+        "q": query,
+        "country": country,
+        "ui_lang": ui_lang,
+        "count": 10,
+    }
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(BRAVE_SEARCH_API_URL, headers=brave_headers(), params=params)
+        if r.status_code != 200:
+            detail = f"Brave API error {r.status_code}: {r.text}"
+            raise HTTPException(status_code=502, detail=detail)
+
+        data = r.json()
+        results = data.get("web", {}).get("results", [])
+        top_urls = [item.get("url") for item in results[:10] if item.get("url")]
+
+        readable_contents = await asyncio.gather(
+            *(fetch_readable_content(client, url) for url in top_urls)
+        )
+
+    return {
+        "query": query,
+        "country": country,
+        "ui_lang": ui_lang,
+        "results": readable_contents,
+    }
